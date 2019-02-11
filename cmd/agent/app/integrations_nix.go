@@ -16,12 +16,13 @@ import (
 )
 
 const (
-	pythonBin = "python"
+	pythonBin     = "python"
+	downloaderBin = "datadog-checks-downloader"
 )
 
 var (
 	relPyPath              = filepath.Join("..", "..", "embedded", "bin", pythonBin)
-	relTufConfigFilePath   = filepath.Join("..", "..", tufConfigFile)
+	relDownloaderPath      = filepath.Join("..", "..", "embedded", "bin", downloaderBin)
 	relChecksPath          = filepath.Join("..", "..", "embedded", "lib", "python2.7", "site-packages", "datadog_checks")
 	relReqAgentReleasePath = filepath.Join("..", "..", reqAgentReleaseFile)
 	relConstraintsPath     = filepath.Join("..", "..", constraintsFile)

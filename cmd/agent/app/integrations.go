@@ -27,7 +27,6 @@ import (
 )
 
 const (
-	tufConfigFile       = "public-tuf-config.json"
 	reqAgentReleaseFile = "requirements-agent-release.txt"
 	constraintsFile     = "final_constraints.txt"
 	tufPkgPattern       = "datadog(-|_).*"
@@ -114,12 +113,9 @@ func init() {
 	integrationCmd.AddCommand(searchCmd)
 	integrationCmd.AddCommand(freezeCmd)
 	integrationCmd.AddCommand(showCmd)
-	integrationCmd.PersistentFlags().BoolVarP(&withoutTuf, "no-tuf", "t", false, "don't use TUF repo")
-	integrationCmd.PersistentFlags().BoolVarP(&inToto, "in-toto", "i", false, "enable in-toto")
 	integrationCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "enable verbose logging on pip and TUF")
 	integrationCmd.PersistentFlags().BoolVarP(&allowRoot, "allow-root", "r", false, "flag to enable root to install packages")
 	integrationCmd.PersistentFlags().BoolVarP(&useSysPython, "use-sys-python", "p", false, "use system python instead [dev flag]")
-	integrationCmd.PersistentFlags().StringVar(&tufConfig, "tuf-cfg", getTufConfigPath(), "path to TUF config file")
 
 	// Power user flags - mark as hidden
 	integrationCmd.PersistentFlags().MarkHidden("use-sys-python")
@@ -176,11 +172,6 @@ var showCmd = &cobra.Command{
 	RunE:  show,
 }
 
-func getTufConfigPath() string {
-	here, _ := executable.Folder()
-	return filepath.Join(here, relTufConfigFilePath)
-}
-
 func getCommandPython() (string, error) {
 	if useSysPython {
 		return pythonBin, nil
@@ -198,14 +189,17 @@ func getCommandPython() (string, error) {
 	return pyPath, nil
 }
 
-func getTUFConfigFilePath() (string, error) {
-	if _, err := os.Stat(tufConfig); err != nil {
+func getCommandDownloader() (string, error) {
+	here, _ := executable.Folder()
+	downloaderPath := filepath.Join(here, relDownloaderPath)
+
+	if _, err := os.Stat(downloaderPath); err != nil {
 		if os.IsNotExist(err) {
-			return tufConfig, err
+			return downloaderPath, errors.New("unable to find downloader executable")
 		}
 	}
 
-	return tufConfig, nil
+	return downloaderPath, nil
 }
 
 func validateArgs(args []string, local bool) error {
@@ -238,7 +232,7 @@ func validateArgs(args []string, local bool) error {
 	return nil
 }
 
-func pip(args []string, local bool) error {
+func pip(args []string) error {
 	if !allowRoot && !authorizedUser() {
 		return errors.New("Please use this tool as the agent-running user")
 	}
@@ -247,18 +241,8 @@ func pip(args []string, local bool) error {
 		color.NoColor = true
 	}
 
-	err := common.SetupConfig(confFilePath)
+	pythonPath, err := getCommandPython()
 	if err != nil {
-		fmt.Printf("Cannot setup config, exiting: %v\n", err)
-		return err
-	}
-
-	pipPath, err := getCommandPython()
-	if err != nil {
-		return err
-	}
-	tufPath, err := getTUFConfigFilePath()
-	if err != nil && !withoutTuf && !local {
 		return err
 	}
 
@@ -274,48 +258,7 @@ func pip(args []string, local bool) error {
 	// Append implicit flags to the *pip* command
 	args = append(args, implicitFlags...)
 
-	pipCmd := exec.Command(pipPath, args...)
-	pipCmd.Env = os.Environ()
-
-	// Proxy support
-	proxies := config.GetProxies()
-	if proxies != nil {
-		pipCmd.Env = append(pipCmd.Env,
-			fmt.Sprintf("HTTP_PROXY=%s", proxies.HTTP),
-			fmt.Sprintf("HTTPS_PROXY=%s", proxies.HTTPS),
-			fmt.Sprintf("NO_PROXY=%s", strings.Join(proxies.NoProxy, ",")),
-		)
-	}
-
-	if !withoutTuf && !local {
-		pipCmd.Env = append(pipCmd.Env,
-			fmt.Sprintf("TUF_CONFIG_FILE=%s", tufPath),
-		)
-
-		// Enable tuf logging
-		if verbose {
-			pipCmd.Env = append(pipCmd.Env,
-				"TUF_ENABLE_LOGGING=1",
-			)
-		}
-
-		// Enable phase 1, aka in-toto
-		if inToto {
-			pipCmd.Env = append(pipCmd.Env,
-				"TUF_DOWNLOAD_IN_TOTO_METADATA=1",
-			)
-			// Change the working directory to one the Datadog Agent can read, so
-			// that we can switch to temporary working directories, and back, for
-			// in-toto.
-			pipCmd.Dir, _ = executable.Folder()
-		}
-	} else {
-		if inToto && withoutTuf {
-			return errors.New("--in-toto conflicts with --no-tuf")
-		} else if inToto && local {
-			return errors.New("--in-toto conflicts with --local-wheel")
-		}
-	}
+	pipCmd := exec.Command(pythonPath, args...)
 
 	// forward the standard output to the Agent logger
 	stdout, err := pipCmd.StdoutPipe()
@@ -389,7 +332,7 @@ func install(cmd *cobra.Command, args []string) error {
 		} else if !ok {
 			return fmt.Errorf("the wheel %s is not an agent check, it will not be installed", args[0])
 		}
-		return pip(append(pipArgs, args[0]), true)
+		return pip(append(pipArgs, args[0]))
 	}
 
 	// Additional verification for installation
@@ -435,9 +378,15 @@ func install(cmd *cobra.Command, args []string) error {
 		)
 	}
 
+	// Download the wheel
+	wheelPath, err := downloadWheel(integration, versionToInstall.String())
+	if err != nil {
+		return fmt.Errorf("error when downloading the wheel for %s %s", integration, versionToInstall)
+	}
+
 	// Install the wheel
-	if err := pip(append(pipArgs, args[0]), false); err != nil {
-		return err
+	if err := pip(append(pipArgs, wheelPath)); err != nil {
+		return fmt.Errorf("error installing wheel %s", wheelPath)
 	}
 
 	// Run pip check to determine if the installed integration is compatible with the base check version
@@ -465,11 +414,20 @@ func install(cmd *cobra.Command, args []string) error {
 			"-y",
 		}
 	} else {
-		pipArgs = append(pipArgs, fmt.Sprintf("%s==%s", integration, currentVersion))
+		// Download the wheel
+		wheelPath, err := downloadWheel(integration, currentVersion.String())
+		if err != nil {
+			// Rollback failed, mention that the integration could be broken
+			return fmt.Errorf(
+				"error when validating the agent's python environment, and the rollback failed, so %s %s was installed and might be broken:\n - %v\n- %v",
+				integration, versionToInstall, pipCheckErr, err,
+			)
+		}
+		pipArgs = append(pipArgs, wheelPath)
 	}
 
 	// Perform the rollback
-	pipErr := pip(pipArgs, false)
+	pipErr := pip(pipArgs)
 	if pipErr == nil {
 		// Rollback successful, return error encountered during `pip check`
 		return fmt.Errorf(
@@ -483,6 +441,72 @@ func install(cmd *cobra.Command, args []string) error {
 		"error when validating the agent's python environment, and the rollback failed, so %s %s was installed and might be broken:\n - %v\n- %v",
 		integration, versionToInstall, pipCheckErr, pipErr,
 	)
+}
+
+func downloadWheel(integration, version string) (string, error) {
+	downloaderPath, err := getCommandDownloader()
+	if err != nil {
+		return "", err
+	}
+	args := []string{
+		integration,
+		"--version", version,
+	}
+	if verbose {
+		args = append(args, "-vvvv")
+	}
+	downloaderCmd := exec.Command(downloaderPath, args...)
+	downloaderCmd.Env = os.Environ()
+
+	// Proxy support
+	if err := common.SetupConfig(confFilePath); err != nil {
+		fmt.Printf("Cannot setup config, exiting: %v\n", err)
+		return "", err
+	}
+	proxies := config.GetProxies()
+	if proxies != nil {
+		downloaderCmd.Env = append(downloaderCmd.Env,
+			fmt.Sprintf("HTTP_PROXY=%s", proxies.HTTP),
+			fmt.Sprintf("HTTPS_PROXY=%s", proxies.HTTPS),
+			fmt.Sprintf("NO_PROXY=%s", strings.Join(proxies.NoProxy, ",")),
+		)
+	}
+
+	// forward the standard output to the Agent logger
+	stdout, err := downloaderCmd.StdoutPipe()
+	if err != nil {
+		return "", err
+	}
+	go func() {
+		in := bufio.NewScanner(stdout)
+		for in.Scan() {
+			fmt.Println(in.Text())
+		}
+	}()
+
+	// forward the standard error to the Agent logger
+	stderr, err := downloaderCmd.StderrPipe()
+	if err != nil {
+		return "", err
+	}
+	go func() {
+		in := bufio.NewScanner(stderr)
+		for in.Scan() {
+			fmt.Println(color.RedString(in.Text()))
+		}
+	}()
+
+	output, err := downloaderCmd.Output()
+	if err != nil {
+		fmt.Printf(color.RedString(
+			fmt.Sprintf("error running command: %v", err)))
+		return "", err
+	}
+
+	// The path to the wheel will be at the last line of the output
+	splitOutput := strings.Split(string(output), "\n")
+	wheelPath := strings.TrimSpace(splitOutput[len(splitOutput)-1])
+	return wheelPath, nil
 }
 
 func validateBaseDependency(wheelPath string) (bool, error) {
@@ -667,7 +691,7 @@ func remove(cmd *cobra.Command, args []string) error {
 	pipArgs = append(pipArgs, args...)
 	pipArgs = append(pipArgs, "-y")
 
-	return pip(pipArgs, false)
+	return pip(pipArgs)
 }
 
 func search(cmd *cobra.Command, args []string) error {
@@ -683,7 +707,7 @@ func search(cmd *cobra.Command, args []string) error {
 	}
 	pipArgs = append(pipArgs, args...)
 
-	return pip(pipArgs, false)
+	return pip(pipArgs)
 }
 
 func freeze(cmd *cobra.Command, args []string) error {
@@ -692,7 +716,7 @@ func freeze(cmd *cobra.Command, args []string) error {
 		"freeze",
 	}
 
-	return pip(pipArgs, false)
+	return pip(pipArgs)
 }
 
 func show(cmd *cobra.Command, args []string) error {
